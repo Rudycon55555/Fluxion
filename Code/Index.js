@@ -1,225 +1,113 @@
-// Code/Index.js
+// Code/Compiler.js
+//
+// Usage (Node, ESM):
+//   node Code/Compiler.js input.fluxion.js output.js
+//
+// This transforms Fluxion syntax:
+//
+//   Fluxion.return[= ... =]
+//   Fluxion.let[=
+//   name = expression
+//   other = () => ...
+//   =]
+//   Fluxion.inject[= ... =]
+//
+// into valid JS that uses the runtime in Code/Index.js.
 
-export const Fluxion = {
-    tags: {},          // functionName -> template string
-    placeholders: {},  // name -> value (any JS: string, function, etc.)
+import fs from "fs";
+import path from "path";
+import { fileURLToPath, pathToFileURL } from "url";
 
-    // Called by compiled tag functions:
-    // ExampleTag() { return Fluxion.return(`...`); }
-    //
-    // Responsibilities:
-    // 1. Determine the calling function’s name
-    // 2. Validate that the template has exactly ONE root HTML tag
-    // 3. Register the template under that name
-    // 4. Return the template (so the function can also return it)
-    return(templateString) {
-        const callerName = this._getCallerFunctionName();
-        if (!callerName) {
-            throw new Error("Fluxion.return() must be called inside a named function");
-        }
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-        const cleaned = templateString.trim();
-        this._ensureSingleRootTag(callerName, cleaned);
-        this.tags[callerName] = cleaned;
-        return cleaned;
-    },
+// CLI entry
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+    const [, , inputPath, outputPath] = process.argv;
 
-    // Called by compiled placeholder blocks:
-    //
-    // Fluxion.let[=
-    // user = "Rudra"
-    // greeting = () => "Hi " + user
-    // =]
-    //
-    // becomes:
+    if (!inputPath || !outputPath) {
+        console.error("Usage: node Code/Compiler.js input.fluxion.js output.js");
+        process.exit(1);
+    }
+
+    const absoluteInput = path.resolve(process.cwd(), inputPath);
+    const source = fs.readFileSync(absoluteInput, "utf8");
+    const compiled = compileFluxion(source);
+
+    const absoluteOutput = path.resolve(process.cwd(), outputPath);
+    fs.writeFileSync(absoluteOutput, compiled, "utf8");
+    console.log(`Compiled ${inputPath} -> ${outputPath}`);
+}
+
+export function compileFluxion(sourceText) {
+    let output = sourceText;
+
+    const importLine = `import "https://raw.githubusercontent.com/Rudycon55555/Fluxion/main/Code/Index.js";`;
+
+    // 1. Ensure the import line at the very top (if not already present)
+    if (!output.includes(importLine)) {
+        output = importLine + "\n\n" + output;
+    }
+
+    // 2. Transform Fluxion.return[= ... =] into Fluxion.return(`...`)
+    output = output.replace(/Fluxion\.return
+
+\[\=([\s\S]*?)\=\]
+
+/g, (_, content) => {
+        return `Fluxion.return(\`${escapeBackticks(content)}\`)`;
+    });
+
+    // 3. Transform Fluxion.let[= ... =] into:
     //
     // Fluxion.let(() => {
-    //   Fluxion.setPlaceholder("user", "Rudra");
-    //   Fluxion.setPlaceholder("greeting", () => "Hi " + user);
-    // });
-    let(fn) {
-        fn(); // run the block that calls setPlaceholder
-    },
+    //   Fluxion.setPlaceholder("name", expression);
+    //   ...
+    // })
+    //
+    // Each non-empty line inside the block must be "name = expression"
+    output = output.replace(/Fluxion\.let
 
-    // Used by compiled code inside Fluxion.let
-    setPlaceholder(name, value) {
-        this.placeholders[name] = value;
-    },
+\[\=([\s\S]*?)\=\]
 
-    // Called by compiled UI:
-    // Fluxion.inject(`...UI template...`)
-    inject(uiTemplate) {
-        let html = uiTemplate;
+/g, (_, block) => {
+        const lines = block
+            .split("\n")
+            .map(l => l.trim())
+            .filter(l => l.length > 0);
 
-        // 1. Expand nested tag calls: OuterTag[=ChildA, ChildB=]
-        html = this._expandNestedTags(html);
-
-        // 2. Expand simple tag names: ExampleTag
-        html = this._expandSimpleTags(html);
-
-        // 3. Substitute placeholders {{{name}}}
-        html = this._substitutePlaceholders(html);
-
-        // 4. Inject into the document (browser) or log (Node)
-        if (typeof document !== "undefined") {
-            document.open();
-            document.write(html);
-            document.close();
-        } else {
-            console.log("Fluxion rendered HTML:\n", html);
-        }
-    },
-
-    // ----------------- Internals -----------------
-
-    _getCallerFunctionName() {
-        const err = new Error();
-        const stack = err.stack || "";
-        const lines = stack.split("\n");
-
-        // Typical stack:
-        // [0] "Error"
-        // [1] "    at Fluxion.return (Index.js:line:col)"
-        // [2] "    at ExampleTag (SomeFile.js:line:col)"
-        const callerLine = lines[2] || "";
-        const match = callerLine.match(/at\s+([A-Za-z0-9_$]+)\s*\(/);
-        return match ? match[1] : null;
-    },
-
-    _ensureSingleRootTag(functionName, template) {
-        const cleaned = template
-            .replace(/<!DOCTYPE[^>]*>/gi, "")
-            .replace(/<!--[\s\S]*?-->/g, "")
-            .trim();
-
-        if (!cleaned.startsWith("<")) {
-            throw new Error(`Fluxion.return in "${functionName}" must start with an HTML tag.`);
-        }
-
-        const tagRegex = /<\/?([a-zA-Z][a-zA-Z0-9-]*)\b[^>]*>/g;
-        const stack = [];
-        let rootCount = 0;
-        let match;
-
-        while ((match = tagRegex.exec(cleaned)) !== null) {
-            const full = match[0];
-            const name = match[1];
-            const isClosing = full.startsWith("</");
-            const selfClosing = /\/>$/.test(full);
-
-            if (!isClosing) {
-                if (stack.length === 0 && !selfClosing) {
-                    rootCount++;
-                }
-                if (!selfClosing) {
-                    stack.push(name);
-                }
-            } else {
-                if (stack.length === 0) {
-                    throw new Error(`Unmatched closing tag </${name}> in "${functionName}".`);
-                }
-                stack.pop();
+        const statements = lines.map(line => {
+            const eqIndex = line.indexOf("=");
+            if (eqIndex === -1) {
+                throw new Error(`Invalid line in Fluxion.let block: "${line}". Expected "name = expression".`);
             }
-
-            if (rootCount > 1) {
-                throw new Error(
-                    `Fluxion.return in "${functionName}" must have exactly ONE root tag, but multiple roots were detected.`
-                );
+            const name = line.slice(0, eqIndex).trim();
+            const expr = line.slice(eqIndex + 1).trim();
+            if (!name) {
+                throw new Error(`Missing placeholder name in Fluxion.let block line: "${line}".`);
             }
-        }
-
-        if (stack.length !== 0) {
-            throw new Error(`Unclosed tag(s) in Fluxion.return of "${functionName}".`);
-        }
-
-        if (rootCount === 0) {
-            throw new Error(`Fluxion.return in "${functionName}" must contain a root HTML tag.`);
-        }
-    },
-
-    _expandNestedTags(html) {
-        // Pattern: OuterTag[=InnerA, InnerB, InnerC=]
-        const nestedTagRegex = /([A-Z][A-Za-z0-9_]*)
-
-\[\=([A-Z0-9_,\s]+)\=\]
-
-/g;
-
-        return html.replace(nestedTagRegex, (_, outerName, innerPart) => {
-            const childNames = innerPart
-                .split(",")
-                .map(n => n.trim())
-                .filter(n => n.length > 0);
-
-            const childrenHtml = childNames
-                .map(name => this._renderTag(name))
-                .join("");
-
-            return this._renderTag(outerName, childrenHtml);
+            if (!expr) {
+                throw new Error(`Missing expression for placeholder "${name}" in Fluxion.let block.`);
+            }
+            return `Fluxion.setPlaceholder("${name}", ${expr});`;
         });
-    },
 
-    _expandSimpleTags(html) {
-        const self = this;
+        return `Fluxion.let(() => { ${statements.join(" ")} })`;
+    });
 
-        return html.replace(/\b([A-Z][A-Za-z0-9_]*)\b/g, function (match, name, offset, full) {
-            const before = full.slice(0, offset);
+    // 4. Transform Fluxion.inject[= ... =] into Fluxion.inject(`...`)
+    output = output.replace(/Fluxion\.inject
 
-            // Avoid replacing inside HTML tags like <html>, <body>, etc.
-            const insideTag = /<[^>]*$/.test(before) && !/>[^<]*$/.test(before);
-            if (insideTag) return match;
+\[\=([\s\S]*?)\=\]
 
-            if (self.tags[name]) {
-                return self._renderTag(name);
-            }
+/g, (_, content) => {
+        return `Fluxion.inject(\`${escapeBackticks(content)}\`)`;
+    });
 
-            return match;
-        });
-    },
+    return output;
+}
 
-    _renderTag(name, childHtml = "") {
-        const template = this.tags[name];
-        if (!template) {
-            throw new Error(`Fluxion tag function "${name}" is not defined.`);
-        }
-
-        let html = template;
-
-        // Allow child placeholder {{{child}}}
-        html = html.replace(/\{\{\{child\}\}\}/g, childHtml);
-
-        // Substitute placeholders {{{name}}}
-        html = this._substitutePlaceholders(html);
-
-        return html;
-    },
-
-    _substitutePlaceholders(html) {
-        const self = this;
-
-        return html.replace(/\{\{\{([^}]+)\}\}\}/g, (_, key) => {
-            const name = key.trim();
-
-            if (name === "child") {
-                // child is handled in _renderTag
-                return "{{{child}}}";
-            }
-
-            const value = self.placeholders[name];
-
-            // If the placeholder is a function, execute it
-            if (typeof value === "function") {
-                try {
-                    const result = value();
-                    return result != null ? String(result) : "";
-                } catch (e) {
-                    console.error(`Error evaluating placeholder "${name}":`, e);
-                    return "";
-                }
-            }
-
-            // Otherwise, treat it as a simple value
-            return value != null ? String(value) : "";
-        });
-    }
-};
+function escapeBackticks(str) {
+    // Avoid breaking template literals if user writes ` inside their Fluxion blocks
+    return str.replace(/`/g, "\\`");
+}
